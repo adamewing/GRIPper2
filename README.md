@@ -32,3 +32,35 @@ optional arguments:
   --biotype BIOTYPE        restrict search to gtf/gff entries with given gene_biotype attribute (e.g. protein_coding)
   --exon_pairs             full exon pair output (default = output junction count)
 ```
+
+Output:
+Tab-delimited, column descriptions:
+
+|--------------------|---------------------------------------------------------------------------------------------------------------|
+|Chrom               |Chromosome                                                                                                     |
+|Left_Break          |Leftmost breakpoint                                                                                            |
+|Right_Break         |Rightmost breakpoint                                                                                           |
+|Ins_Strand          |Strand of insertion, relative to reference gene (+ = same orientation as ref, - = opposite orientation to ref) |
+|Gene_Name           |Donor gene name                                                                                                |
+|Gene_Chrom          |Chromosome of donor gene                                                                                       |
+|Gene_Start          |Leftmost position of breakpoint in donor gene                                                                  |
+|Gene_End            |Rightmost position of breakpoints in donor gene                                                                |
+|Gene_Strand         |Strand of donor gene from annotation                                                                           |
+|Sample_Count        |Number of samples in which GRIP is detected                                                                    |
+|Sample_List         |Samples in which GRIP is detected                                                                              |
+|Exons_Overlapped    |Number of exons between Gene_Start and Gene_End                                                                |
+|Left_Map_Score      |Mapping score of left end vs genome                                                                            |
+|Right_Map_Score     |Mapping score of right end vs genome                                                                           |
+|Left_Split_Support  |Number of split reads supporting left breakpoint                                                               |
+|Left_Split_Samples  |Number of split reads supporting left breakpoint per sample                                                    |
+|Right_Split_Support |Number of split reads supporting right breakpoint                                                              |
+|Right_Split_Samples |Number of split reads supporting right breakpoint per sample                                                   |
+|Disc_Read_Count     |Number of supporting discordant reads                                                                          |
+|Disc_Samples        |Number of supporting discordant reads per sample                                                               |
+|Left_Split_Len      |Length (bp) of non-reference part of left consensus (lower-case bases)                                         |
+|Right_Split_Len     |Length (bp) of non-reference part of right consensus (lower-case bases)                                        |
+|Left_Cons           |Left consensus                                                                                                 |
+|Right_Cons          |Right consensus                                                                                                |
+|TSD                 |Target site duplication (NA if not present)                                                                    |
+|Exon_Pairs          |Number of potential exon-exon joins detected or list of exon-exon pairs (if --exon_pairs is given)             |
+
