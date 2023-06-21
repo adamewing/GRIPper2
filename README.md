@@ -1,6 +1,8 @@
 # GRIPper2
 Detect gene retrocopy insertion polymorphisms (GRIPs) from short-read paired-end WGS data
 
+Updated version of [GRIPper](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2013-14-3-r22).
+
 ## Install:
 Using conda (or mamba):
 ```
