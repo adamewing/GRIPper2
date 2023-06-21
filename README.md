@@ -34,8 +34,8 @@ optional arguments:
 ```
 
 Output:
-Tab-delimited, column descriptions:
-
+Tab-delimited:
+|Column              |Description                                                                                                    |
 |--------------------|---------------------------------------------------------------------------------------------------------------|
 |Chrom               |Chromosome                                                                                                     |
 |Left_Break          |Leftmost breakpoint                                                                                            |
