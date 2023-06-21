@@ -899,10 +899,10 @@ def process_gene(args, bam_files, gene):
         exons_overlapped,
         '%.3f' % left_map_score,
         '%.3f' % right_map_score,
-        '%.3f' % left_cons_score,
-        '%.3f' % right_cons_score,
-        '%.3f' % left_cons_match,
-        '%.3f' % right_cons_match,
+        # '%.3f' % left_cons_score,
+        # '%.3f' % right_cons_score,
+        # '%.3f' % left_cons_match,
+        # '%.3f' % right_cons_match,
         len(ins_best_left[1]),
         left_split_samples,
         len(ins_best_right[1]),
@@ -926,6 +926,35 @@ def call(args):
     mmi = index_mmi(args.ref)
     fai = index_fai(args.ref)
 
+    header = [
+        'Chrom',
+        'Left_Break',
+        'Right_Break',
+        'Ins_Strand',
+        'Gene_Name',
+        'Gene_Chrom',
+        'Gene_Start',
+        'Gene_End',
+        'Gene_Strand',
+        'Sample_Count',
+        'Sample_List',
+        'Exons_Overlapped',
+        'Left_Map_Score',
+        'Right_Map_Score',
+        'Left_Split_Support',
+        'Left_Split_Samples',
+        'Right_Split_Support',
+        'Right_Split_Samples',
+        'Disc_Read_Count',
+        'Disc_Samples',
+        'Left_Split_Len',
+        'Right_Split_Len',
+        'Left_Cons',
+        'Right_Cons',
+        'TSD',
+        'Exon_Pairs'
+    ]
+
     genes = build_genes(args.gtf, args.biotype)
 
     bam_files = args.bams.split(',')
@@ -938,6 +967,8 @@ def call(args):
         res = pool.apply_async(process_gene, [args, bam_files, genes[g]])
         reslist.append(res)
         #process_gene(args, bam_files, genes[g])
+
+    print('\t'.join(header))
 
     for res in reslist:
         out = res.get()
@@ -975,4 +1006,3 @@ if __name__ == '__main__':
     parser_call.add_argument('--exon_pairs', default=False, action='store_true', help='full exon pair output (default = output junction count)')
     args = parser.parse_args()
     main(args)
-
