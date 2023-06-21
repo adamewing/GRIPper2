@@ -1,0 +1,978 @@
+#!/usr/bin/env python
+
+import os
+import sys
+import gzip
+import argparse
+import subprocess
+import logging
+import multiprocessing as mp
+import re
+import string
+
+import numpy as np
+import pysam
+
+from operator import itemgetter
+from collections import defaultdict as dd
+from collections import Counter
+from skbio import DNA, alignment
+
+FORMAT = '%(asctime)s %(message)s'
+logging.basicConfig(format=FORMAT)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+
+import warnings
+warnings.filterwarnings('ignore', module='skbio')
+
+class Gene:
+    def __init__(self, ensg, name, chrom, strand):
+        self.ensg      = ensg
+        self.name      = name
+        self.strand    = strand
+        self.chrom     = chrom
+        self.tx_start  = None
+        self.tx_end    = None
+        self.cds_start = None
+        self.cds_end   = None
+        self.exons     = []
+
+    def add_exon(self, block):
+        assert len(block) == 2
+
+        if block[0] > block[1]:
+            block[0], block[1] = block[1], block[0]
+
+        if block not in self.exons:
+            self.exons.append(block)
+            self.exons = sorted(self.exons, key=itemgetter(0))
+
+    def add_tx(self, block):
+        assert len(block) == 2
+        assert block[0] < block[1]
+        if self.tx_start is None or self.tx_start > block[0]:
+            self.tx_start = block[0]
+
+        if self.tx_end is None or self.tx_end < block[1]:
+            self.tx_end = block[1]
+
+    def add_cds(self, block):
+        assert len(block) == 2
+        if block[0] > block[1]:
+            logger.warning('CDS block start > end in gene %s' % self.ensg)
+            return None
+
+        if self.cds_start is None or self.cds_start > block[0]:
+            self.cds_start = block[0]
+
+        if self.cds_end is None or self.cds_end < block[1]:
+            self.cds_end = block[1]
+
+    def has_tx(self):
+        return None not in (self.tx_start, self.tx_end)
+
+    def has_cds(self):
+        return None not in (self.cds_start, self.cds_end)
+
+    def merge_exons(self):
+        new_exons = []
+        if len(self.exons) == 0:
+            return
+
+        last_block = self.exons[0]
+
+        for block in self.exons[1:]:
+            if min(block[1], last_block[1]) - max(block[0], last_block[0]) > 0: # overlap
+                last_block = [min(block[0], last_block[0]), max(block[1], last_block[1])]
+
+            else:
+                new_exons.append(last_block)
+                last_block = block
+
+        new_exons.append(last_block)
+
+        self.exons = new_exons
+
+
+def consensus(seqs, minscore = 0.9):
+    ''' build consensus from sorted aligned reads iteratively '''
+
+    seqs = [s[0] for s in seqs]
+    #seqs = [qualtrim(sorted_read.read, minqual=minqual) for sorted_read in sorted(sortable_reads)]
+    seqs = [s for s in seqs if len(s) > 20]
+
+    if len(seqs) == 0:
+        return '', 0.0
+
+    if len(seqs) == 1: # no consensus necessary
+        return seqs[0], 1.0
+
+    uniq_seqs = [seqs[0]]
+    for i, seq in enumerate(seqs[1:], start=1):
+        if seq != seqs[i-1]:
+            uniq_seqs.append(seq)
+
+    if len(uniq_seqs) == 1: # all seqs were the same!
+        return uniq_seqs[0], 1.0
+
+    cons = uniq_seqs[0]
+    scores = []
+
+    for seq in uniq_seqs[1:]:
+        cons = cons.replace('N','A') # N not allowed in conservation calculation from scikit-bio
+        seq = seq.replace('N','A')
+
+        s1 = DNA(cons)
+        s2 = DNA(seq)
+
+        try:
+            aln_res = alignment.local_pairwise_align_ssw(s1, s2)
+        except (IndexError, ValueError): # scikit-bio throws this if no bases align  >:|
+            return cons, 0.0
+            
+        aln_tab = aln_res[0]
+
+        s1_aln, s2_aln = aln_res[2]
+
+        a1 = cons[s1_aln[0]:s1_aln[1]+1]
+
+        score = 0.0
+        if aln_tab.shape.position > 10: # param?
+            score = sum(aln_tab.conservation(gap_mode='include')==1.)/aln_tab.shape.position
+
+        if re.search(a1, cons):
+            cons_start, cons_end = s1_aln[0], s1_aln[1]+1
+
+            if score >= minscore and cons_end > len(cons)-5:
+                scores.append(score)
+                align_end = s2_aln[1]+1
+                cons += seq[align_end:]
+
+    if scores:
+        return cons, np.mean(scores)
+
+    else:
+        return cons, 0.0
+
+
+def check_match(frag_seq, ref_seq, trim_pA=False):
+    if len(frag_seq) > len(ref_seq):
+        return 0.0, None, None
+
+    if trim_pA:
+        frag_seq = frag_seq.rstrip('A')
+        frag_seq = frag_seq.lstrip('T')
+
+    if len(frag_seq) < 20:
+        return 0.0, None, None
+
+    frag_seq = DNA(frag_seq.upper())
+    ref_seq = DNA(ref_seq.upper())
+
+    try:
+        aln, score, pos = alignment.local_pairwise_align_ssw(frag_seq, ref_seq)
+    except ValueError:
+        return 0.0, None, None
+
+    match = (score/2)/len(frag_seq)
+    frag_aln, ref_aln = pos
+
+    return match, frag_aln, ref_aln
+
+
+def lowercase_match(frag_seq, ref_seq):
+    match, frag_aln, ref_aln = check_match(frag_seq, ref_seq)
+    lc_start, lc_end = ref_aln
+    if lc_start > lc_end:
+        lc_start, lc_end = lc_end, lc_start
+    
+    out_seq = ''
+
+    if lc_start == 0:
+        out_seq = (ref_seq[:lc_end+1]).lower() + (ref_seq[lc_end+1:]).upper()
+    
+    elif lc_end == len(ref_seq)-1:
+        out_seq = (ref_seq[:lc_start]).upper() + (ref_seq[lc_start:]).lower()
+        
+    else:
+        out_seq = (ref_seq[:lc_start]).upper() + (ref_seq[lc_start:lc_end]).lower() + (ref_seq[lc_end:]).upper()
+
+    return out_seq, match
+
+
+def tsd_check(left_seq, right_seq, exp_tsd_seq, allow_offset=2):
+    if not exp_tsd_seq:
+        return 'NA'
+    
+    table = str.maketrans('', '', string.ascii_lowercase)
+    left_seq = left_seq.translate(table)
+    right_seq = right_seq.translate(table)
+
+    right_tsd = right_seq[len(right_seq)-len(exp_tsd_seq)-allow_offset:]
+    left_tsd = left_seq[:len(exp_tsd_seq)+2]
+
+    min_score = len(exp_tsd_seq)-1/len(exp_tsd_seq)
+
+    if len(exp_tsd_seq) < 5:
+        min_score = 1.0
+
+    right_score = check_match(exp_tsd_seq, right_tsd)[0]
+    left_score = check_match(exp_tsd_seq, left_tsd)[0]
+
+    tsd_score = (right_score + left_score) / 2
+
+    if min_score < tsd_score:
+        return 'NA'
+    
+    return exp_tsd_seq
+
+
+def rc(dna):
+    ''' reverse complement '''
+    complements = str.maketrans('acgtrymkbdhvACGTRYMKBDHV', 'tgcayrkmvhdbTGCAYRKMVHDB')
+    return dna.translate(complements)[::-1]
+
+
+def index_mmi(fasta):
+    mmi_out = fasta + '.mmi'
+
+    if os.path.exists(mmi_out):
+        logger.info(f'index found for {fasta}: {mmi_out}')
+        return mmi_out
+    else:
+        logger.info(f'building mmi index for {fasta}: {mmi_out}')
+
+    cmd = ['minimap2', fasta, '-d', mmi_out]
+    
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    for line in p.stdout:
+        line = line.decode()
+
+    assert os.path.exists(mmi_out), f'index failure: {mmi_out}'
+
+    return mmi_out
+
+
+def index_fai(fasta):
+    fai_out = fasta + '.fai'
+
+    if os.path.exists(fai_out):
+        logger.info(f'index found for {fasta}: {fai_out}')
+        return fai_out
+    else:
+        logger.info(f'building fai index for {fasta}: {fai_out}')
+
+    cmd = ['samtools', 'faidx', fasta]
+    
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    for line in p.stdout:
+        line = line.decode()
+
+    assert os.path.exists(fai_out), f'index failure: {fai_out}'
+
+    return fai_out
+
+
+def build_genes(gtf_fn, biotype):
+    logger.info(f'loading genes from {gtf_fn}')
+    genes = {}
+
+    with gzip.open(gtf_fn) as gtf:
+        for line in gtf:
+            line = line.decode()
+            if line.startswith('#'):
+                continue
+
+            chrom, source, feature, start, end, score, strand, frame, attribs = line.split('\t')
+
+            block = sorted([int(start), int(end)])
+
+            attribs = attribs.strip()
+
+            attr_dict = {}
+
+            for attrib in attribs.split(';'):
+                if attrib:
+                    key, val = attrib.strip().split()[:2]
+                    key = key.strip()
+                    val = val.strip().strip('"')
+                    attr_dict[key] = val
+
+            if biotype:
+                if 'gene_biotype' not in attr_dict:
+                    continue
+
+                if attr_dict['gene_biotype'] != biotype:
+                    continue
+
+            if 'gene_id' not in attr_dict:
+                continue
+
+            if 'gene_name' not in attr_dict:
+                attr_dict['gene_name'] = attr_dict['gene_id']
+
+            ensg = attr_dict['gene_id']
+            name = attr_dict['gene_name']
+
+            if ensg not in genes:
+                genes[ensg] = Gene(ensg, name, chrom, strand)
+
+            if feature in ('five_prime_utr', 'exon', 'three_prime_utr'):
+                genes[ensg].add_exon(block)
+
+            if feature == 'CDS':
+                genes[ensg].add_cds(block)
+
+            if feature == 'transcript':
+                genes[ensg].add_tx(block)
+            
+            genes[ensg].merge_exons()
+
+    logger.info(f'loaded {len(genes)} genes')
+
+    return genes
+
+
+def check_split(rec, min_split=10):
+    if rec.cigarstring is None:
+        return []
+
+    if 'S' not in rec.cigarstring:
+        return []
+
+    aps = rec.get_aligned_pairs()
+
+    if not aps:
+        return []
+    
+    left_aps = []
+
+    for ap in aps:
+        if ap[1] is None:
+            left_aps.append(ap)
+        else:
+            break
+
+    right_aps = []
+    
+    for ap in aps[::-1]:
+        if ap[1] is None:
+            right_aps.append(ap)
+        else:
+            break
+
+    left_bp = None
+
+    if left_aps:
+        if len(left_aps) >= min_split:
+            left_bp = aps[len(left_aps)][1]
+    
+    right_bp = None
+
+    if right_aps:
+        if len(right_aps) >= min_split:
+            right_bp = aps[0-len(right_aps)-1][1]
+
+    if left_bp == right_bp == None:
+        return []
+
+    left_unmap_seq = None
+
+    if left_bp:
+        left_unmap_seq = rec.seq[:len(left_aps)]
+
+    right_unmap_seq = None
+
+    if right_bp:
+        right_unmap_seq = rec.seq[0-len(right_aps):]
+
+    return [left_bp, right_bp, left_unmap_seq, right_unmap_seq, rec.seq, rec.reference_start, rec.reference_end]
+
+
+def discordant_footprint(bams, gene, mindist=1e6, joindist=100):
+    disc_ends = []
+    disc_groups = []
+
+    for bam in bams:
+        if gene.chrom not in bam.references:
+            continue
+        
+        for exon in gene.exons:
+            for rec in bam.fetch(gene.chrom, exon[0], exon[1]): 
+                if rec.is_duplicate:
+                    continue
+
+                if rec.mate_is_unmapped:
+                    continue
+
+                if rec.next_reference_name != gene.chrom or abs(rec.next_reference_start-exon[0]) > mindist:
+                    disc_ends.append([rec.next_reference_name, rec.next_reference_start, bam.filename.decode()])
+
+    logger.debug(f'found {len(disc_ends)} disc reads for {gene.name}')
+
+    if len(disc_ends) == 0:
+        return disc_ends
+
+    disc_ends.sort(key=itemgetter(0,1))
+
+    group = []
+    for d in disc_ends:
+        if len(group) == 0:
+            group.append(d)
+            continue
+
+        if group[-1][0] != d[0] or d[1] - group[-1][1] > joindist:
+            disc_groups.append(group)
+            group = []
+            continue
+
+        group.append(d)
+
+    disc_groups.append(group)
+
+    return disc_groups
+
+def remove_masked(disc_groups, mask):
+    mask = pysam.Tabixfile(mask)
+    non_masked_groups = []
+
+    for g in disc_groups:
+        masked = False
+
+        if len(g) == 0:
+            continue
+
+        g_chrom = g[0][0]
+        assert g_chrom == g[-1][0]
+        g_start, g_end = g[0][1], g[-1][1]
+
+        if g_chrom in mask.contigs:
+            for _ in mask.fetch(g_chrom, g_start, g_end):
+                masked = True
+                break
+        
+        if not masked:
+            non_masked_groups.append(g)
+
+    return non_masked_groups
+
+
+def remove_known_pseudo(disc_groups, gtf):
+    non_pseudo_groups = []
+
+    if len(disc_groups) == 0:
+        return non_pseudo_groups
+
+    for g in disc_groups:
+        likely_pseudogene = False
+
+        if len(g) == 0:
+            continue
+
+        g_chrom = g[0][0]
+        assert g_chrom == g[-1][0]
+        g_start, g_end = g[0][1], g[-1][1]
+
+        if g_chrom in gtf.contigs:
+            for rec in gtf.fetch(g_chrom, g_start, g_end):
+                chrom, source, feature, start, end, score, strand, frame, attribs = rec.split('\t')
+
+                attribs = attribs.strip()
+                attr_dict = {}
+
+                for attrib in attribs.split(';'):
+                    if attrib:
+                        key, val = attrib.strip().split()[:2]
+                        key = key.strip()
+                        val = val.strip().strip('"')
+                        attr_dict[key] = val
+                
+                if 'transcript_biotype' in attr_dict:
+                    if 'pseudo' in attr_dict['transcript_biotype']:
+                        likely_pseudogene = True
+                
+                if 'gene_biotype' in attr_dict:
+                    if 'pseudo' in attr_dict['gene_biotype']:
+                        likely_pseudogene = True
+    
+        if not likely_pseudogene:
+            non_pseudo_groups.append(g)
+    
+    return non_pseudo_groups
+
+
+def uniq_pairs(pairs):
+    pair_dict = {}
+
+    for p in pairs:
+        if p[0] not in pair_dict:
+            pair_dict[p[0]] = p[1]
+
+        else:
+            if abs(p[0]-p[1]) < abs(p[0]-pair_dict[p[0]]):
+                pair_dict[p[0]] = p[1]
+
+    uniq_pairs = []
+
+    for k, v in pair_dict.items():
+        pair = sorted([k,v])
+        if pair not in uniq_pairs:
+            uniq_pairs.append(pair)
+
+    pairs = uniq_pairs
+    pair_dict = {}
+
+    for p in pairs:
+        if p[1] not in pair_dict:
+            pair_dict[p[1]] = p[0]
+        
+        else:
+            if abs(p[1]-p[0]) < abs(p[1]-pair_dict[p[1]]):
+                pair_dict[p[1]] = p[0]
+
+    uniq_pairs = []
+
+    for k, v in pair_dict.items():
+        pair = sorted([k,v])
+        if pair not in uniq_pairs:
+            uniq_pairs.append(pair)
+
+    return uniq_pairs
+
+
+def exon_disc_joins(bams, gene):
+    pairs = []
+
+    for i, exon in enumerate(gene.exons):
+        for bam in bams:
+            for read in bam.fetch(gene.chrom, exon[0], exon[1]):
+                if read.is_duplicate:
+                    continue
+
+                if read.next_reference_name != gene.chrom:
+                    continue
+
+                for j, other_exon in enumerate(gene.exons):
+                    if i == j:
+                        continue
+
+                    if other_exon[0]-len(read.seq) < read.next_reference_start and other_exon[1]+len(read.seq) > read.next_reference_start:
+                        pair = sorted([i,j])
+
+                        if pair not in pairs:
+                            pairs.append(pair)
+
+    return uniq_pairs(pairs)
+
+
+def exon_split_joins(bams, gene, ref):
+    junctions = []
+    exon_splits = {}
+
+    for i, exon in enumerate(gene.exons):
+        splits = dd(list)
+
+        for bam in bams:
+            exon_start, exon_end = exon
+
+            if exon_start > exon_end:
+                exon_start, exon_end = exon_end, exon_start
+
+            for rec in bam.fetch(gene.chrom, exon_start-50, exon_end+50):
+                if rec.is_duplicate:
+                    continue
+
+                split_state = check_split(rec)
+                
+                if split_state:
+                    left_bp, right_bp, left_seq, right_seq, full_seq, ref_start, ref_end = split_state
+
+                    if left_bp:
+                        if left_seq not in splits[left_bp]:
+                            splits[left_bp].append(left_seq)
+
+                    if right_bp:
+                        if right_seq not in splits[right_bp]:
+                            splits[right_bp].append(right_seq)
+
+        exon_splits[i] = splits
+
+    for i in exon_splits:
+        for pos in exon_splits[i]:
+            splits[pos] = sorted(splits[pos], key=lambda x: len(x))
+
+            if len(splits[pos]) == 0:
+                continue
+
+            if len(splits[pos][-1]) > 30:
+                split_seq = splits[pos][-1]
+
+                for j in range(len(gene.exons)):
+                    if j == i:
+                        continue
+
+                    ex_start, ex_end = gene.exons[j]
+                    ex_seq = ref.fetch(gene.chrom, ex_start-100, ex_end+100)
+                    ex_score, ex_frag_pos, ex_pos = check_match(split_seq, ex_seq)
+
+                    junc = sorted([i,j])
+
+                    if ex_score > 0.5:
+                        #junctions.append([i, j, ex_score, ex_frag_pos, ex_pos, False])
+                        junctions.append(junc)
+                        continue
+
+                    ex_score, ex_frag_pos, ex_pos = check_match(split_seq, rc(ex_seq))
+
+                    if ex_score > 0.5:
+                        #junctions.append([i, j, ex_score, ex_frag_pos, ex_pos, True])
+                        junctions.append(junc)
+    
+    return uniq_pairs(junctions)
+
+
+def process_gene(args, bam_files, gene):
+    logger.debug(f'processing {gene.name}, {gene.chrom}:{gene.tx_start}-{gene.tx_end}')
+    bams = [pysam.AlignmentFile(b) for b in bam_files]
+    ref = pysam.Fastafile(args.ref)
+    gtf = pysam.Tabixfile(args.gtf)
+
+    disc_groups = discordant_footprint(bams, gene)
+    logger.debug(f'initial disc_groups for {gene.name}: {len(disc_groups)}')
+
+    disc_groups = remove_known_pseudo(disc_groups, gtf)
+
+    if args.mask:
+        disc_groups = remove_masked(disc_groups, args.mask)
+
+    logger.debug(f'final disc_groups for {gene.name}: {len(disc_groups)}')
+
+    disc_groups = sorted(disc_groups, key=lambda x: len(x))
+
+    if len(disc_groups) == 0:
+        logger.debug(f'rejected {gene.name}: disc_groups==0')
+        return None
+
+    if len(disc_groups[-1]) < int(args.mindisc):
+        logger.debug(f'rejected {gene.name}: --mindisc')
+        return None
+
+    d_best = disc_groups[-1]
+
+    d_chrom = d_best[0][0]
+    assert d_chrom == d_best[-1][0]
+    d_start, d_end = d_best[0][1], d_best[-1][1]
+
+    ins_left_splits = dd(list)
+    ins_right_splits = dd(list)
+    ins_full_reads = dd(list)
+
+    ins_left_splits_samples = dd(list)
+    ins_right_splits_samples = dd(list)
+
+    split_counter = 0
+
+    for bam in bams:
+        if d_start-150 < 0:
+            d_start = 150
+
+        for rec in bam.fetch(d_chrom, d_start-150, d_end+150):
+            if rec.is_duplicate:
+                continue
+
+            split_state = check_split(rec)
+            
+            if split_state:
+                split_counter += 1
+                
+                left_bp, right_bp, left_seq, right_seq, full_seq, ref_start, ref_end = split_state
+
+                if None not in (left_bp, right_bp):
+                    continue
+
+                if left_bp:
+                    left_bp = f'{d_chrom}:{left_bp}'
+                    ins_left_splits[left_bp].append(left_seq)
+                    ins_left_splits_samples[left_bp].append(os.path.basename(bam.filename).decode())
+
+                    ins_full_reads[left_bp].append([full_seq, ref_end])
+
+                if right_bp:
+                    right_bp = f'{d_chrom}:{right_bp}'
+                    ins_right_splits[right_bp].append(right_seq)
+                    ins_right_splits_samples[right_bp].append(os.path.basename(bam.filename).decode())
+
+                    ins_full_reads[right_bp].append([full_seq, ref_start])
+
+    logger.debug(f'found {split_counter} split reads in {gene.name}')
+
+    for pos in ins_left_splits:
+        ins_left_splits[pos] = sorted(ins_left_splits[pos], key=lambda x: len(x))
+        #ins_left_splits[pos].append(ins_left_splits_samples[pos])
+
+    for pos in ins_right_splits:
+        ins_right_splits[pos] = sorted(ins_right_splits[pos], key=lambda x: len(x))
+        #ins_right_splits[pos].append(ins_right_splits_samples[pos])
+
+    if len(ins_left_splits) == 0:
+        logger.debug(f'rejected {gene.name}: no left splits')
+        return None
+    
+    if len(ins_right_splits) == 0:
+        logger.debug(f'rejected {gene.name}: no right splits')
+        return None
+
+    ins_best_left = sorted(list(ins_left_splits.items()), key=lambda x: len(x[1]), reverse=True)[0]
+    ins_best_right = sorted(list(ins_right_splits.items()), key=lambda x: len(x[1]), reverse=True)[0]
+
+    if len(ins_best_left[1]) < int(args.minjunc):
+        logger.debug(f'rejected {gene.name}: --minjunc')
+        return None
+
+    if len(ins_best_right[1]) < int(args.minjunc):
+        logger.debug(f'rejected {gene.name}: --minjunc')
+        return None
+
+    ins_best_left_seq = ins_best_left[1][-1]
+    ins_best_right_seq = ins_best_right[1][-1]
+
+    ins_best_left_chrom, ins_best_left_pos = ins_best_left[0].split(':')
+    ins_best_left_pos = int(ins_best_left_pos)
+
+    ins_best_right_chrom, ins_best_right_pos = ins_best_right[0].split(':')
+    ins_best_right_pos = int(ins_best_right_pos)
+
+    if ins_best_left_chrom != ins_best_right_chrom:
+        logger.debug(f'rejected {gene.name}: disc chrom mismatch')
+        return None
+
+    if abs(ins_best_left_pos - ins_best_right_pos) > int(args.maxtsd):
+        logger.debug(f'rejected {gene.name}: --maxtsd')
+        return None
+
+    if len(ins_best_left_seq) < 50:
+        logger.debug(f'rejected {gene.name}: ins_best_left_seq ({len(ins_best_left_seq)})')
+        return None
+    
+    if len(ins_best_right_seq) < 50:
+        logger.debug(f'rejected {gene.name}: ins_best_right_seq ({len(ins_best_right_seq)})')
+        return None
+
+    tx_seq = ref.fetch(gene.chrom, gene.tx_start, gene.tx_end)
+    
+    '''
+    strand gets a bit hairy as the initial gene insertion has a strandedness as well as the insertion relative to that insertion
+    "flipped" indicates the strandedness is apparently opposite to that of the parent e.g. if parent is "-" and ins is "+" then
+    parent gene had 5'UTR to the right of the 3'UTR where as GRIP has the opposite orientation (5'UTR to the left of 3'UTR)
+    '''
+    flipped = False
+
+    left_map_score, left_frag_pos, left_tx_pos = check_match(ins_best_left_seq, tx_seq, trim_pA=True)
+    right_map_score, right_frag_pos, right_tx_pos = check_match(ins_best_right_seq, tx_seq, trim_pA=True)
+
+    remap_score = (left_map_score + right_map_score)/2
+
+    rc_left_map_score, rc_left_frag_pos, rc_left_tx_pos = check_match(ins_best_left_seq, rc(tx_seq), trim_pA=True)
+    rc_right_map_score, rc_right_frag_pos, rc_right_tx_pos = check_match(ins_best_right_seq, rc(tx_seq), trim_pA=True)
+
+    if (rc_left_map_score + rc_right_map_score)/2 > remap_score:
+        remap_score = (rc_left_map_score + rc_right_map_score)/2
+        left_map_score, left_frag_pos, left_tx_pos = rc_left_map_score, rc_left_frag_pos, rc_left_tx_pos
+        right_map_score, right_frag_pos, right_tx_pos = rc_right_map_score, rc_right_frag_pos, rc_right_tx_pos
+        flipped = True
+
+    if remap_score < float(args.remapscore):
+        logger.debug(f'rejected {gene.name}: --remapscore ({remap_score})')
+        return None
+
+    if left_map_score < float(args.remapscore):
+        logger.debug(f'rejected {gene.name}: left_map_score ({left_map_score})')
+        return None
+
+    if right_map_score < float(args.remapscore):
+        logger.debug(f'rejected {gene.name}: right_map_score ({right_map_score})')
+        return None
+
+    if None in (left_tx_pos, right_tx_pos):
+        logger.debug(f'rejected {gene.name}: None in left_tx or right_tx')
+        return None
+
+    ins_strand = gene.strand
+    if flipped:
+        if ins_strand == '+':
+            ins_strand = '-'
+        elif ins_strand == '-':
+            ins_strand = '+'
+
+    left_ref_pos = [left_tx_pos[0]+gene.tx_start, left_tx_pos[1]+gene.tx_start]
+    right_ref_pos = [right_tx_pos[0]+gene.tx_start, right_tx_pos[1]+gene.tx_start]
+
+    grip_start = min(left_ref_pos + right_ref_pos)
+    grip_end = max(left_ref_pos + right_ref_pos)
+
+    left_read_pile = sorted(ins_full_reads[f'{ins_best_left_chrom}:{ins_best_left_pos}'], key=itemgetter(1))
+    right_read_pile = sorted(ins_full_reads[f'{ins_best_right_chrom}:{ins_best_right_pos}'], key=itemgetter(1))
+
+    left_cons, left_cons_score = consensus(left_read_pile)
+    right_cons, right_cons_score = consensus(right_read_pile)
+    left_cons, left_cons_match = lowercase_match(ins_best_left_seq, left_cons)
+    right_cons, right_cons_match = lowercase_match(ins_best_right_seq, right_cons)
+
+    if left_cons_score < 0.9:
+        logger.debug(f'rejected {gene.name}: left_cons_score ({left_cons_score})')
+        return None
+
+    if right_cons_score < 0.9:
+        logger.debug(f'rejected {gene.name}: right_cons_score ({right_cons_score})')
+        return None
+
+    if left_cons_match < 0.9:
+        logger.debug(f'rejected {gene.name}: left_cons_match ({left_cons_match})')
+        return None
+
+    if right_cons_match < 0.9:
+        logger.debug(f'rejected {gene.name}: right_cons_match ({right_cons_match})')
+        return None
+
+    tsd_start = ins_best_left_pos
+    tsd_end = ins_best_right_pos
+
+    if tsd_start > tsd_end:
+        tsd_start, tsd_end = tsd_end, tsd_start
+
+    exp_tsd_seq = ref.fetch(ins_best_left_chrom, tsd_start, tsd_end)
+
+    tsd_seq = tsd_check(left_cons, right_cons, exp_tsd_seq)
+
+    # exon overlap check
+    exons_overlapped = 0
+
+    for exon in gene.exons:
+        if min(exon[1], grip_end) - max(exon[0], grip_start) > 0:
+            exons_overlapped += 1
+
+    if exons_overlapped == 0:
+        logger.debug(f'rejected {gene.name}: no exons overlapped {gene.chrom}:{grip_start}-{grip_end}')
+        return None
+
+    exon_pairs = exon_split_joins(bams, gene, ref)
+    exon_pairs += exon_disc_joins(bams, gene)
+
+    exon_pairs = uniq_pairs(exon_pairs)
+    exon_out = len(exon_pairs)
+
+    if args.exon_pairs:
+        exon_out = ','.join([f'{i}-{j}' for i,j in exon_pairs])
+
+    disc_samples = Counter([s[-1] for s in disc_groups[-1]])
+    disc_samples = ','.join([f'{os.path.basename(k)}|{v}' for k,v in disc_samples.items()])
+
+    left_split_samples = Counter(ins_left_splits_samples[ins_best_left[0]])
+    right_split_samples = Counter(ins_right_splits_samples[ins_best_right[0]])
+
+    left_split_samples = ','.join([f'{os.path.basename(k)}|{v}' for k,v in left_split_samples.items()])
+    right_split_samples = ','.join([f'{os.path.basename(k)}|{v}' for k,v in right_split_samples.items()])
+
+    all_samples = []
+    for s_list in (disc_samples, left_split_samples, right_split_samples):
+        all_samples += [s.split('|')[0] for s in s_list.split(',')]
+
+    all_samples = list(set(all_samples))
+    sample_count = len(all_samples)
+    sample_list = ','.join(all_samples)
+
+    output = [
+        ins_best_left_chrom,
+        ins_best_left_pos, 
+        ins_best_right_pos,
+        ins_strand,
+        gene.name,
+        gene.chrom,
+        grip_start,
+        grip_end,
+        gene.strand,
+        sample_count,
+        sample_list,
+        exons_overlapped,
+        '%.3f' % left_map_score,
+        '%.3f' % right_map_score,
+        '%.3f' % left_cons_score,
+        '%.3f' % right_cons_score,
+        '%.3f' % left_cons_match,
+        '%.3f' % right_cons_match,
+        len(ins_best_left[1]),
+        left_split_samples,
+        len(ins_best_right[1]),
+        right_split_samples,
+        len(disc_groups[-1]),
+        disc_samples,
+        len(ins_best_left_seq),
+        len(ins_best_right_seq),
+        left_cons,
+        right_cons,
+        tsd_seq,
+        exon_out
+    ]
+
+    output = map(str, output)
+
+    return output
+        
+
+def call(args):
+    mmi = index_mmi(args.ref)
+    fai = index_fai(args.ref)
+
+    genes = build_genes(args.gtf, args.biotype)
+
+    bam_files = args.bams.split(',')
+
+    pool = mp.Pool(processes=int(args.procs))
+
+    reslist = []
+
+    for g in genes:
+        res = pool.apply_async(process_gene, [args, bam_files, genes[g]])
+        reslist.append(res)
+        #process_gene(args, bam_files, genes[g])
+
+    for res in reslist:
+        out = res.get()
+        if out is not None:
+            print('\t'.join(out))
+
+
+def main(args):
+    logger.info('starting GRIPper2 with command: %s' % ' '.join(sys.argv))
+    args.func(args)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='GRIPper2')
+    subparsers = parser.add_subparsers(title="tool", dest="tool")
+    subparsers.required = True
+
+    __version__ = "0.1"
+    parser.add_argument('-v', '--version', action='version', version='%(prog)s {version}'.format(version=__version__))
+
+    parser_call = subparsers.add_parser('call')
+
+    parser_call.set_defaults(func=call)
+
+    parser_call.add_argument('-r', '--ref', required=True, help='reference genome (fasta)')
+    parser_call.add_argument('-b', '--bams', required=True, help='.bam files (comma-delimited)')
+    parser_call.add_argument('-g', '--gtf', required=True, help='.gtf file bgzipped/tabix indexed, generally expects ENSEMBL gtfs')
+    parser_call.add_argument('-p', '--procs', default=1, help='parallel processes')
+    parser_call.add_argument('-m', '--mask', default=None, help='mask insertion sites in regions (tabix indexed)')
+    parser_call.add_argument('--mindisc', default=2, help='minimum discordant read count (default = 2)')
+    parser_call.add_argument('--minjunc', default=2, help='minimum split read count per junction (default = 1)')
+    parser_call.add_argument('--remapscore', default=0.5, help='minimum junction mapping to TE score (default = 0.5)')
+    parser_call.add_argument('--maxtsd', default=100, help='max TSD size (default = 100)')
+    parser_call.add_argument('--biotype', default=None, help='restrict search to gtf/gff entries with given gene_biotype attribute (e.g. protein_coding)')
+    parser_call.add_argument('--exon_pairs', default=False, action='store_true', help='full exon pair output (default = output junction count)')
+    args = parser.parse_args()
+    main(args)
+
